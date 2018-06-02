@@ -11,26 +11,7 @@ from celery import Celery
 import pymongo
 import logging
 import json
-
-
-def make_celery(app):
-    celery = Celery(
-        app.import_name,
-        backend=app.config["CELERY_RESULT_BACKEND"],
-        broker=app.config["CELERY_BROKER_URL"],
-    )
-    celery.conf.update(app.config)
-    TaskBase = celery.Task
-
-    class ContextTask(TaskBase):
-        abstract = True
-
-        def __call__(self, *args, **kwargs):
-            with app.app_context():
-                return TaskBase.__call__(self, *args, **kwargs)
-
-    celery.Task = ContextTask
-    return celery
+import os
 
 
 app = Flask(__name__)
@@ -40,95 +21,55 @@ api = Api(app)
 mongo = PyMongo(app)
 cache = Cache(app, config={"CACHE_TYPE": "redis"})
 redis_store = FlaskRedis(app)
-celery = make_celery(app)
-
 
 parser = reqparse.RequestParser()
-parser.add_argument("url", location="json", required=True)
-parser.add_argument("data", location="json", required=True)
+parser.add_argument("ssinfo", location="json", required=True)
 
 
-class Task(Resource):
+class Ip(Resource):
 
     def post(self):
         args = parser.parse_args()
-        data = json.loads(args.data)
-        save2db(data, args.url)
-
-    def get(self):
-        try:
-            ret = redis_store.lpop("urls")
-            if ret:
-                ret = ret.decode("utf8")
-                return json.loads(ret)
-
-            else:
-                return {"status": "ok", "url": ""}
-        except Exception as e:
-            return {"status": "", "msg": str(e)}
+        print(args.ssinfo)
+        data = eval(args.ssinfo)
+        update_squid_conf(data["ip_port"])
+        # save2db(data, 'ip_port')
+        return {"data": data}
 
 
-class Feed(Resource):
-
-    def get(self, id):
-        return [
-            i["target"]
-            for i in mongo.db.feed.find({"verb": "QUESTION_FOLLOW"}).limit(10)
-        ]
-
-
-def save2db(data, url):
+def save2db(data, k):
     if isinstance(data, list):
         for i in data:
-            i["source_url"] = url
-            mongo.db.user.insert_one(i)
+            mongo.db.ss.update_one({k: i[k]}, {"$set": i}, upsert=True)
     else:
-        data["source_url"] = url
-        mongo.db.user.insert_one(i)
+        mongo.db.ss.update_one({k: data[k]}, {"$set": data}, upsert=True)
 
 
-def getLastTime(url_token):
-    # 返回某个人最新动态的时间
-    xx = (
-        mongo.db.user.find(
-            {"actor.url_token": url_token}, {"created_time": 1, "_id": 0}
-        )
-        .sort([("created_time", -1)])
-        .limit(1)
+def update_squid_conf(ipport):
+    with open("/usr/local/etc/squid.conf.example", "r") as f:
+        default_conf = f.read()
+    proxy = ipport.split(":")
+    index = redis_store.incr("iplist")
+    proxy_conf = (
+        "cache_peer "
+        + proxy[0]
+        + " parent "
+        + proxy[1]
+        + " 0 no-query weighted-round-robin weight=2 connect-fail-limit=2 allow-miss max-conn=5 name=proxy-"
+        + str(index)
+        + "\n"
     )
-    return xx["created_time"]
+    default_conf += proxy_conf
+    with open("/usr/local/etc/squid.conf", "w") as f:
+        f.write(default_conf)
+
+    message = os.system("brew services restart squid")
+    print(message)
 
 
-@celery.task
-def upLastime():
-    "每5分钟更新"
-    baseUrl = "https://www.zhihu.com/api/v4/members/{}/activities"
-    c = mongo.db.user.aggregate(
-        [
-            {
-                "$group": {
-                    "_id": {"url_token": "$actor.url_token"},
-                    "max": {"$max": "$created_time"},
-                }
-            }
-        ]
-    )
-    for i in c:
-        redis_store.rpush(
-            "urls",
-            json.dumps(
-                {
-                    "status": "ok",
-                    "lastTime": int(i["max"]),
-                    "url": baseUrl.format(i["_id"]["url_token"]),
-                }
-            ),
-        )
-
-
-api.add_resource(Task, "/api/task")
-api.add_resource(Feed, "/api/feed/<string:id>")
+api.add_resource(Ip, "/api/ss")
+# api.add_resource(Feed, "/api/feed/<string:id>")
 
 
 if __name__ == "__main__":
-    app.run(debug=False, host="0.0.0.0", port=8000, threaded=False)
+    app.run(debug=False, host="0.0.0.0", port=8200, threaded=False)
